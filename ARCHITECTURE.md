@@ -68,7 +68,50 @@ Trước khi Verifier xuất JSON cuối cùng, các biến bất biến (invari
 
 ## 7. Reproducibility
 
-*   **Model**: Sử dụng cố định OpenAI `gpt-4o-mini`.
+*   **Model**: Sử dụng cố định **`Gemini 3.1 Flash Light`**.
 *   **Config**: `temperature = 0.0` cho toàn bộ Agents để đảm bảo tính tất định (deterministic).
 *   **Concurrency**: Chạy lệnh giới hạn song song 10 cases (`max_workers=10`).
 *   **Dependencies**: Pin cứng phiên bản trong `pyproject.toml` và `uv.lock`.
+
+## 8. Verifier contract (Thành viên 5)
+
+Code: `src/student_agent/evidence.py`, `src/student_agent/verifier.py`, test: `tests/test_verifier.py`.
+
+**Cách specialist nối vào Verifier:**
+
+```python
+ledger = EvidenceLedger()                      # tạo 1 lần cho cả lượt chạy (chặn tái dùng ref chéo case)
+verifier = VerifierAgent(contracts, ledger, trace)
+
+ev = await collect_evidence(gateway, ledger, trace, case_id=cid, actor="payment-agent",
+                            tool_name="get_payment_timeline", order_id=order_id)
+# ev = None nếu tool báo lỗi (vd: không có refund event) -> không tự bịa dữ liệu
+
+report = SpecialistReport(agent="payment-agent", case_id=cid,
+                          evidence=[e for e in (ev,) if e], proposed_issue="duplicate_charge")
+output = verifier.verify(case, [order_report, payment_report, shipment_policy_report])
+```
+
+`collect_evidence` tự emit `tool_result_consumed` kèm `evidence_ref`. `proposed_issue` là tùy chọn.
+
+**Verifier làm gì:**
+
+1. Chỉ nhận evidence có trong `EvidenceLedger` và thuộc đúng `case_id`; evidence lạ bị loại (đếm vào trace).
+2. Lọc bản ghi nhiễu theo vòng đời đơn hàng: item có `shipping_limit_date` trong `[purchase, estimated_delivery]`,
+   capture trong `[purchase, approved + 1 ngày]`, refund/payment event trong `[purchase, opened_at]`,
+   shipment event trong `[purchase, max(opened_at, delivered) + 1 ngày]`; bỏ bản ghi trùng lặp y hệt.
+3. Tự kiểm chứng `primary_issue` theo thứ tự ưu tiên: refund failed → refund pending → order canceled/unavailable
+   đã capture → reconciliation mismatch mở → capture lặp vượt tổng đơn (duplicate) / tổng capture = tổng đơn (split)
+   → giao trễ theo timestamp của order row (seller nếu bàn giao carrier sau `shipping_limit_date`, ngược lại logistics)
+   → `unsupported_claim`. Thiếu order → `insufficient_evidence`. Lời khai của khách không phải ground truth.
+4. So với `proposed_issue` của specialist: bất đồng thì giảm confidence; chỉ nhận đề xuất của specialist khi
+   Verifier không tìm thấy tín hiệu nào (`unsupported_claim`).
+5. Áp policy: `case_status`, `recommended_action`, bên chịu trách nhiệm. `party_id` seller trong policy là ví dụ
+   của order khác nên được thay bằng seller thực của case. Số tiền hoàn tính từ dữ liệu (hoàn phí ship bị chặn
+   bởi số tiền đã capture), `refund_pending` không hoàn thêm.
+6. Chỉ trích evidence liên quan tới issue (bảng `CITATIONS`), không trích `get_customer_history`/`get_product_context`.
+   `payment_references`/`shipment_ids` chỉ điền khi dữ liệu có id thật, không tự tạo.
+7. Kiểm invariant (ref thuộc case, `no_action` ⇒ refund 0, tổng `refund_lines` = refund, refund ≤ số đã capture,
+   seller chịu trách nhiệm ∈ `affected_entities.seller_ids`, confidence ∈ [0,1]), sau đó validate JSON Schema.
+8. Emit trace: `policy_decided` → `verification_completed` (kèm toàn bộ evidence_refs của output) →
+   `handoff` verifier → coordinator. Coordinator vẫn phải emit `task_assigned` và `handoff` sang specialist/verifier.

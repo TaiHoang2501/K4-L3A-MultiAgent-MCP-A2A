@@ -4,6 +4,8 @@ from typing import Any, List
 from pydantic import BaseModel, Field
 
 from .mcp_gateway import EvidenceGateway
+from .order_agent import OrderItemAgent
+from .payment import run_payment_agent
 from .trace import TraceWriter
 
 
@@ -21,6 +23,20 @@ class MessageEnvelope(BaseModel):
 async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
     """Agent của Dũng"""
    
+async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
+    """Agent của Dũng"""
+    case = envelope.payload
+    case_id = envelope.case_id
+    claimed_order_id = case.get("customer_request", {}).get("claimed_order_id")
+
+    order_agent = OrderItemAgent(gateway, trace)
+    order_result = await order_agent.run(case_id, claimed_order_id)
+
+    for ref in order_result.get("evidence_refs", []):
+        if ref not in envelope.evidence_refs_collected:
+            envelope.evidence_refs_collected.append(ref)
+
+    envelope.payload["order_agent_result"] = order_result
     envelope.sender = "order_agent"
     return envelope
 
@@ -72,6 +88,14 @@ async def call_shipment_policy_agent(envelope: MessageEnvelope, gateway: Evidenc
     if report.get("data_conflicts"):
         envelope.data_conflicts.extend(report.get("data_conflicts", []))
 
+    """Agent của Long: Chuyên gia điều tra Thanh toán & Dòng tiền"""
+    return await run_payment_agent(envelope, gateway, trace)
+
+
+async def call_shipment_policy_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
+    """Agent của Quân"""
+
+    envelope.sender = "shipment_policy_agent"
     return envelope
 
 async def call_verifier_agent(envelope: MessageEnvelope, trace: TraceWriter) -> dict[str, Any]:
@@ -94,6 +118,7 @@ async def solve_case(
     
 
     trace.info("agent_started", {"case_id": case_id, "role": "coordinator"})
+    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
     
     envelope = MessageEnvelope(
         case_id=case_id,
@@ -120,6 +145,23 @@ async def solve_case(
         
     except Exception as e:
         trace.error("workflow_error", {"case_id": case_id, "error": str(e)})
+        trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="order_agent")
+        envelope = await call_order_agent(envelope, gateway, trace)
+        
+        trace.emit(case_id=case_id, event_type="handoff", actor="order_agent", target="payment_agent")
+        envelope = await call_payment_agent(envelope, gateway, trace)
+        
+        trace.emit(case_id=case_id, event_type="handoff", actor="payment_agent", target="shipment_policy_agent")
+        envelope = await call_shipment_policy_agent(envelope, gateway, trace)
+        
+        trace.emit(case_id=case_id, event_type="handoff", actor="shipment_policy_agent", target="verifier_agent")
+        final_output = await call_verifier_agent(envelope, trace)
+        
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        return final_output
+        
+    except Exception as e:
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator", attributes={"error": str(e)})
         
         return {
             "primary_issue": "needs_investigation",

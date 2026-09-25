@@ -27,6 +27,7 @@ class EvidenceGateway:
         is_error = getattr(result, "is_error", None)
         if is_error is None:
             is_error = getattr(result, "isError", False)
+        is_error = getattr(result, "isError", getattr(result, "is_error", False))
         if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
