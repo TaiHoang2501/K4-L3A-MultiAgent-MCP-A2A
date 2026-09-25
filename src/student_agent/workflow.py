@@ -55,7 +55,7 @@ async def solve_case(
     case_id = case.get("case_id", "UNKNOWN")
     
 
-    trace.emit(case_id=case_id, event_type="agent_started", actor="coordinator")
+    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
     
     envelope = MessageEnvelope(
         case_id=case_id,
@@ -77,11 +77,11 @@ async def solve_case(
         trace.emit(case_id=case_id, event_type="handoff", actor="shipment_policy_agent", target="verifier_agent")
         final_output = await call_verifier_agent(envelope, trace)
         
-        trace.emit(case_id=case_id, event_type="handoff_completed", actor="coordinator")
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
         return final_output
         
     except Exception as e:
-        trace.emit(case_id=case_id, event_type="workflow_error", actor="coordinator", attributes={"error": str(e)})
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator", attributes={"error": str(e)})
         
         return {
             "primary_issue": "needs_investigation",
