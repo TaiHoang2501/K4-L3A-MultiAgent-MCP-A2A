@@ -21,6 +21,7 @@ from typing import Any
 
 from student_agent.mcp_gateway import EvidenceGateway
 from student_agent.trace import TraceWriter
+from student_agent.verifier import detect_late_delivery, scope_facts
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +155,8 @@ def _analyse_shipment(
 
     # --- Check if customer received late ---
     logistics_delayed = False
-    if delivered_customer and estimated_delivery:
-        if delivered_customer > estimated_delivery:
-            logistics_delayed = True
+    if delivered_customer and estimated_delivery and delivered_customer > estimated_delivery:
+        logistics_delayed = True
     # Also treat never-delivered as a potential logistics issue
     if delivered_customer is None and estimated_delivery and order_status not in ("canceled",):
         logistics_delayed = True
@@ -200,6 +200,63 @@ def _analyse_shipment(
         "is_late": seller_delayed or logistics_delayed,
         "seller_delayed": seller_delayed,
         "logistics_delayed": logistics_delayed,
+        "order_status": order_status,
+    }
+
+
+def _analysis_from_order(
+    order: dict[str, Any],
+    opened_at: str | None,
+    shipment_data: dict[str, Any],
+    sellers_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Same result shape as _analyse_shipment, but scoped to the authoritative order row.
+
+    Lateness comes from the order timestamps; stale ``delivered_late`` events and
+    shipping limits outside the order lifecycle (distractor rows) are ignored.
+    """
+    limits = [
+        {
+            "order_item_id": limit.get("order_item_id"),
+            "seller_id": limit.get("seller_id"),
+            "shipping_limit_date": limit.get("shipping_limit_at"),
+        }
+        for limit in shipment_data.get("shipping_limits", [])
+    ]
+    facts = scope_facts(
+        {"opened_at": opened_at},
+        {
+            "get_order": order,
+            "get_order_items": limits,
+            "get_shipment_summary": shipment_data,
+            "get_sellers": sellers_data,
+        },
+    )
+    decision = detect_late_delivery(facts)
+    order_status = order.get("order_status", "unknown")
+    if decision is None:
+        return {
+            "primary_issue": "unsupported_claim",
+            "responsible_parties": [{"party_type": "customer", "party_id": None}],
+            "ranked_causes": [{"cause_code": "NO_DELIVERY_ISSUE", "rank": 1}],
+            "is_late": False,
+            "seller_delayed": False,
+            "logistics_delayed": False,
+            "order_status": order_status,
+        }
+    seller_late = decision.issue == "late_delivery_seller"
+    parties = (
+        [{"party_type": "seller", "party_id": sid} for sid in facts.seller_ids]
+        if seller_late
+        else [{"party_type": "logistics_provider", "party_id": None}]
+    )
+    return {
+        "primary_issue": decision.issue,
+        "responsible_parties": parties or [{"party_type": "seller", "party_id": None}],
+        "ranked_causes": [{"cause_code": decision.issue.upper(), "rank": 1}],
+        "is_late": True,
+        "seller_delayed": seller_late,
+        "logistics_delayed": not seller_late,
         "order_status": order_status,
     }
 
@@ -290,6 +347,8 @@ class ShipmentPolicyAgent:
         order_id: str,
         claims: list[dict[str, Any]],
         policy_version: str = "EC_POLICY_V1",
+        order: dict[str, Any] | None = None,
+        opened_at: str | None = None,
     ) -> dict[str, Any]:
         """Run the full shipment & policy investigation for a single case.
 
@@ -303,6 +362,11 @@ class ShipmentPolicyAgent:
             Customer claims, each with ``claim_id`` and ``topic``.
         policy_version : str
             Policy document version (usually ``"EC_POLICY_V1"``).
+        order : dict, optional
+            Authoritative order row from the Order agent. When given, lateness is judged
+            on the order lifecycle and distractor rows are ignored.
+        opened_at : str, optional
+            Case opening timestamp, used to scope events to the order lifecycle.
 
         Returns
         -------
@@ -405,7 +469,10 @@ class ShipmentPolicyAgent:
         policy_rules = policy_data.get("rules", {})
 
         # ── 4. Analyse shipment timeline ───────────────────────────
-        analysis = _analyse_shipment(shipment_data, seller_ids)
+        if order:
+            analysis = _analysis_from_order(order, opened_at, shipment_data, sellers_data)
+        else:
+            analysis = _analyse_shipment(shipment_data, seller_ids)
 
         # Cross-check policy-listed responsible parties vs our analysis
         primary_issue = analysis["primary_issue"]

@@ -280,10 +280,10 @@ def test_foreign_evidence_is_never_cited_and_trace_is_linked(harness: Harness) -
     assert verification["evidence_refs"] == output["evidence_refs"]
 
 
-def test_weak_verdict_adopts_single_specialist_proposal(harness: Harness) -> None:
+def test_specialist_disagreement_lowers_confidence_but_evidence_wins(harness: Harness) -> None:
     output = harness.run(
         base_tools(order(), [capture("89.00")]),
-        claim="payment_mismatch", proposed_issue="payment_mismatch",
+        claim="late_delivery_logistics", proposed_issue="late_delivery_logistics",
     )
-    assert output["assessment"]["primary_issue"] == "payment_mismatch"
-    assert output["assessment"]["confidence"] < 0.8
+    assert output["assessment"]["primary_issue"] == "unsupported_claim"
+    assert output["assessment"]["confidence"] == 0.85

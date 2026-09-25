@@ -68,31 +68,36 @@ Trước khi Verifier xuất JSON cuối cùng, các biến bất biến (invari
 
 ## 7. Reproducibility
 
-*   **Model**: Sử dụng cố định **`Gemini 3.1 Flash Light`**.
+*   **Model**: Payment agent gọi Qwen `qwen/qwen3-8b` qua OpenRouter (`llm.py`, cấu hình `OPENROUTER_*` hoặc `API_KEY`/`BASE_URL`/`MODEL_NAME`) chỉ khi luật tất định không kết luận được. Order, Shipment/Policy và Verifier hoàn toàn tất định, không dùng LLM; kết luận cuối do Verifier chốt từ evidence.
 *   **Config**: `temperature = 0.0` cho toàn bộ Agents để đảm bảo tính tất định (deterministic).
-*   **Concurrency**: Chạy lệnh giới hạn song song 10 cases (`max_workers=10`).
+*   **Concurrency**: `day09 run` chạy song song tối đa 10 case (`MAX_CONCURRENT_CASES` trong `cli.py`).
+*   **Một lượt chạy = một phiên MCP**: evidence được audit theo team/run/case, nên không trộn evidence của hai phiên. Nếu phiên MCP hỏng giữa chừng, gateway đánh dấu `session_lost`, CLI bỏ toàn bộ kết quả và chạy lại từ đầu trong phiên mới (tối đa 3 lần).
+*   **Lọc bản ghi dùng chung**: `scope_facts`, `detect_payment_issue`, `detect_late_delivery` trong `verifier.py` được Payment, Shipment/Policy và Verifier dùng chung để mọi agent suy luận trên cùng tập bản ghi hợp lệ.
 *   **Dependencies**: Pin cứng phiên bản trong `pyproject.toml` và `uv.lock`.
 
 ## 8. Verifier contract (Thành viên 5)
 
 Code: `src/student_agent/evidence.py`, `src/student_agent/verifier.py`, test: `tests/test_verifier.py`.
 
-**Cách specialist nối vào Verifier:**
+**Tích hợp trong `workflow.py` (Coordinator):**
 
-```python
-ledger = EvidenceLedger()                      # tạo 1 lần cho cả lượt chạy (chặn tái dùng ref chéo case)
-verifier = VerifierAgent(contracts, ledger, trace)
-
-ev = await collect_evidence(gateway, ledger, trace, case_id=cid, actor="payment-agent",
-                            tool_name="get_payment_timeline", order_id=order_id)
-# ev = None nếu tool báo lỗi (vd: không có refund event) -> không tự bịa dữ liệu
-
-report = SpecialistReport(agent="payment-agent", case_id=cid,
-                          evidence=[e for e in (ev,) if e], proposed_issue="duplicate_charge")
-output = verifier.verify(case, [order_report, payment_report, shipment_policy_report])
+```text
+case_received (CLI)
+→ task_assigned ×3 (coordinator → order-agent, payment_agent, shipment_policy_agent)
+→ với từng specialist: handoff coordinator→agent, agent gọi MCP (tool_result_consumed),
+  handoff agent→coordinator (kèm evidence_refs mới)
+→ task_assigned + handoff coordinator→verifier
+→ policy_decided, verification_completed, handoff verifier→coordinator
+→ case_finalized (CLI)
 ```
 
-`collect_evidence` tự emit `tool_result_consumed` kèm `evidence_ref`. `proposed_issue` là tùy chọn.
+- Specialist nhận `RecordingGateway` thay cho gateway gốc: mọi response MCP thành công được ghi vào
+  `EvidenceLedger` (một ledger cho cả lượt chạy) với `actor` là agent đang chạy. Agent không cần tự ghi evidence.
+- Verifier dựng `SpecialistReport` từ ledger theo actor; `proposed_issue` lấy từ `payment_analysis.detected_issue`
+  và từ shipment report (chỉ khi là `late_delivery_*`).
+- Specialist lỗi không làm hỏng case: coordinator ghi `handoff` với `decision_code=SPECIALIST_FAILED` và
+  Verifier kết luận trên evidence còn lại.
+- Agent mới có thể dùng `collect_evidence(...)` trong `evidence.py` để gọi tool + emit `tool_result_consumed`.
 
 **Verifier làm gì:**
 

@@ -7,6 +7,15 @@ from typing import Any
 from .llm import chat_completion
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
+from .verifier import detect_payment_issue, scope_facts
+
+REFUND_REASON_CODES = {
+    "duplicate_charge": "DUPLICATE_CHARGE_REFUND",
+    "refund_failed": "RETRY_FAILED_REFUND",
+    "canceled_order_paid": "CANCELED_ORDER_FULL_REFUND",
+    "unavailable_order_paid": "UNAVAILABLE_ORDER_REFUND",
+    "payment_mismatch": "RECONCILE_PAYMENT_MISMATCH",
+}
 
 
 async def call_tool_with_retry(
@@ -23,6 +32,9 @@ async def call_tool_with_retry(
         try:
             result = await gateway.call(tool_name, case_id=case_id, **arguments)
             return result
+        except RuntimeError:
+            # Lỗi cấp tool từ gateway (vd: order không có refund event) là tất định: không retry.
+            return None
         except Exception as exc:
             error_str = str(exc).lower()
             if "not found" in error_str or "404" in error_str:
@@ -51,7 +63,8 @@ Lịch sử hoàn tiền: {json.dumps(refund_data, ensure_ascii=False)}
 
 Hãy trả về JSON theo định dạng:
 {{
-  "detected_issue": "duplicate_charge | payment_mismatch | refund_pending | refund_failed | valid_split_payment | canceled_order_paid | null",
+  "detected_issue": "duplicate_charge | payment_mismatch | refund_pending | refund_failed |
+    valid_split_payment | canceled_order_paid | null",
   "reason_code": "Mã nguyên nhân viết HOA ví dụ DUPLICATE_CHARGE_REFUND",
   "refund_amount_brl": 0.0,
   "explanation": "Giải thích ngắn gọn 1 câu"
@@ -60,14 +73,19 @@ Hãy trả về JSON theo định dạng:
     try:
         response_text = await chat_completion(
             messages=[
-                {"role": "system", "content": "Bạn là chuyên gia đối soát tài chính, chỉ trả về JSON."},
+                {
+                    "role": "system",
+                    "content": "Bạn là chuyên gia đối soát tài chính, chỉ trả về JSON.",
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
             response_format_json=True,
             timeout=30.0,
         )
-        return json.loads(response_text)
+        parsed = json.loads(response_text)
+        # LLM đôi khi trả về chuỗi/mảng JSON thay vì object: bỏ qua để không làm crash agent.
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
 
@@ -85,7 +103,8 @@ async def run_payment_agent(
     3. Thu thập evidence_ref và emit trace tool_result_consumed.
     4. Phân tích tài chính: duplicate_charge, payment_mismatch, refund_pending,
        refund_failed, valid_split_payment.
-    5. Xây dựng cấu trúc financial_resolution chuẩn (currency BRL, recommended_refund_brl, refund_lines).
+    5. Xây dựng cấu trúc financial_resolution chuẩn
+       (currency BRL, recommended_refund_brl, refund_lines).
     6. Lưu payment_references và kết quả phân tích vào envelope để Verifier sử dụng.
     """
     case_id = envelope.case_id
@@ -168,7 +187,6 @@ async def run_payment_agent(
     else:
         payments_list = []
 
-    timeline_data = timeline_raw.get("data", {}) if timeline_raw else {}
     refund_data = refund_raw.get("data", {}) if refund_raw else {}
 
     # 4. Phân tích dòng tiền & Payment References
@@ -195,98 +213,45 @@ async def run_payment_agent(
 
     total_paid_brl = round(total_paid_brl, 2)
 
-    # 5. Phân tích Refund
-    refund_status = "none"
-    refund_amount_brl = 0.0
-    if isinstance(refund_data, dict):
-        refund_status = str(refund_data.get("status", "none")).lower()
-        refund_amount_brl = float(refund_data.get("amount", 0.0) or 0.0)
-    elif isinstance(refund_data, list) and refund_data:
-        first_refund = refund_data[0] if isinstance(refund_data[0], dict) else {}
-        refund_status = str(first_refund.get("status", "none")).lower()
-        refund_amount_brl = float(first_refund.get("amount", 0.0) or 0.0)
+    # 5-6. Chỉ xét bản ghi thuộc vòng đời đơn hàng (dữ liệu có bản ghi gây nhiễu lệch thời gian),
+    #      dùng chung bộ lọc và luật với Verifier để kết luận nhất quán.
+    order_result = payload.get("order_agent_result") or {}
+    facts = scope_facts(
+        payload,
+        {
+            "get_order": order_result.get("order_data"),
+            "get_order_items": order_result.get("items"),
+            "get_order_payments": payments_list,
+            "get_payment_timeline": timeline_raw.get("data") if timeline_raw else None,
+            "get_refund_timeline": refund_data,
+        },
+    )
+    latest_refund = facts.refunds[-1] if facts.refunds else {}
+    refund_status = str(latest_refund.get("status", "none")).lower()
+    refund_amount_brl = round(sum(float(r.get("amount_brl") or 0) for r in facts.refunds), 2)
 
-    # 6. Phát hiện các lỗi thanh toán (Primary Issue Detection)
     detected_issue: str | None = None
     recommended_refund_brl: float = 0.0
     refund_lines: list[dict[str, Any]] = []
-
-    # a. Kiểm tra duplicate_charge: có 2 khoản tiền bằng nhau, cùng loại thanh toán
-    has_duplicate = False
-    dup_amount = 0.0
-    seen_values: dict[float, int] = {}
-    for p in payments_list:
-        if isinstance(p, dict):
-            v = round(float(p.get("payment_value", 0.0) or 0.0), 2)
-            if v > 0:
-                seen_values[v] = seen_values.get(v, 0) + 1
-                if seen_values[v] > 1:
-                    has_duplicate = True
-                    dup_amount = v
-
-    if has_duplicate and ("duplicate_charge" in claim_topics or len(payments_list) >= 2):
-        detected_issue = "duplicate_charge"
-        recommended_refund_brl = dup_amount
-        refund_lines.append({
-            "reason_code": "DUPLICATE_CHARGE_REFUND",
-            "amount_brl": round(dup_amount, 2),
-            "entity_id": order_id or None,
-        })
-
-    # b. Kiểm tra refund_failed / refund_pending
-    elif refund_status in ("failed", "error", "rejected"):
-        detected_issue = "refund_failed"
-        pending_amt = refund_amount_brl if refund_amount_brl > 0 else total_paid_brl
-        recommended_refund_brl = pending_amt
-        refund_lines.append({
-            "reason_code": "RETRY_FAILED_REFUND",
-            "amount_brl": round(pending_amt, 2),
-            "entity_id": order_id or None,
-        })
-
-    elif refund_status in ("pending", "processing", "in_review"):
-        detected_issue = "refund_pending"
-        pending_amt = refund_amount_brl if refund_amount_brl > 0 else total_paid_brl
-        recommended_refund_brl = pending_amt
-        refund_lines.append({
-            "reason_code": "EXPEDITE_PENDING_REFUND",
-            "amount_brl": round(pending_amt, 2),
-            "entity_id": order_id or None,
-        })
-
-    # c. Kiểm tra valid_split_payment (khách dùng voucher + credit_card hoặc chia nhiều thẻ)
-    elif len(payments_list) > 1 and not has_duplicate:
-        if "valid_split_payment" in claim_topics or len(set(payment_methods)) > 1:
-            detected_issue = "valid_split_payment"
-            recommended_refund_brl = 0.0
-
-    # d. Đơn hàng bị hủy hoặc không có hàng mà đã trừ tiền (canceled_order_paid / unavailable_order_paid)
-    elif "canceled_order_paid" in claim_topics and total_paid_brl > 0:
-        detected_issue = "canceled_order_paid"
-        rem = max(0.0, total_paid_brl - refund_amount_brl)
-        recommended_refund_brl = rem
-        if rem > 0:
+    decision = detect_payment_issue(facts) if facts.order is not None else None
+    if decision is not None:
+        detected_issue = decision.issue
+        recommended_refund_brl = float(decision.computed_refund or 0)
+        if recommended_refund_brl > 0:
             refund_lines.append({
-                "reason_code": "CANCELED_ORDER_FULL_REFUND",
-                "amount_brl": round(rem, 2),
-                "entity_id": order_id or None,
-            })
-
-    elif "unavailable_order_paid" in claim_topics and total_paid_brl > 0:
-        detected_issue = "unavailable_order_paid"
-        rem = max(0.0, total_paid_brl - refund_amount_brl)
-        recommended_refund_brl = rem
-        if rem > 0:
-            refund_lines.append({
-                "reason_code": "UNAVAILABLE_ORDER_REFUND",
-                "amount_brl": round(rem, 2),
+                "reason_code": REFUND_REASON_CODES.get(detected_issue, "ADJUSTMENT_REFUND"),
+                "amount_brl": round(recommended_refund_brl, 2),
                 "entity_id": order_id or None,
             })
 
     # e. Nếu chưa rõ và có claim về payment, hỏi Qwen 8B
-    payment_related_claims = {"duplicate_charge", "payment_mismatch", "refund_pending", "refund_failed"}
+    payment_related_claims = {
+        "duplicate_charge", "payment_mismatch", "refund_pending", "refund_failed"
+    }
     if not detected_issue and (set(claim_topics) & payment_related_claims):
-        llm_res = await analyze_payment_with_llm(customer_message, claim_topics, payments_list, refund_data)
+        llm_res = await analyze_payment_with_llm(
+            customer_message, claim_topics, payments_list, refund_data
+        )
         if llm_res.get("detected_issue") in payment_related_claims:
             detected_issue = llm_res["detected_issue"]
             amt = float(llm_res.get("refund_amount_brl", 0.0) or 0.0)
@@ -326,7 +291,9 @@ async def run_payment_agent(
         "detected_issue": detected_issue,
         "financial_resolution": financial_resolution,
         "responsible_party": {
-            "party_type": "payment_provider" if detected_issue in ("duplicate_charge", "refund_failed") else "platform",
+            "party_type": "payment_provider"
+            if detected_issue in ("duplicate_charge", "refund_failed")
+            else "platform",
             "party_id": None,
         },
     }

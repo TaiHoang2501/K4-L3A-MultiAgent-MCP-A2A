@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
@@ -8,10 +7,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Qwen LLM Configuration
-API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen-3-8b")
+# Qwen LLM Configuration. Accepts the generic names (API_KEY/BASE_URL/MODEL_NAME)
+# or the OpenRouter names used in the team's .env (OPENROUTER_API_KEY/OPENROUTER_MODEL).
+DASHSCOPE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+
+
+def _settings() -> tuple[str, str, str]:
+    api_key = os.getenv("API_KEY") or os.getenv("OPENROUTER_API_KEY") or ""
+    default_url = OPENROUTER_URL if os.getenv("OPENROUTER_API_KEY") else DASHSCOPE_URL
+    base_url = (os.getenv("BASE_URL") or default_url).rstrip("/")
+    model_name = os.getenv("MODEL_NAME") or os.getenv("OPENROUTER_MODEL") or "qwen-3-8b"
+    return api_key, base_url, model_name
 
 
 async def chat_completion(
@@ -26,14 +33,12 @@ async def chat_completion(
 
     Uses `httpx2` which is already included in the repository dependencies.
     """
-    api_key = os.getenv("API_KEY", API_KEY)
-    if not api_key or api_key == "your_qwen_api_key_here":
+    api_key, base_url, default_model = _settings()
+    if not api_key or api_key in ("your_qwen_api_key_here", "replace_me"):
         raise ValueError(
-            "Chưa cấu hình API_KEY trong file .env! Vui lòng điền API_KEY=... vào file .env"
+            "Chưa cấu hình API_KEY hoặc OPENROUTER_API_KEY trong file .env"
         )
-
-    base_url = os.getenv("BASE_URL", BASE_URL).rstrip("/")
-    model_name = model or os.getenv("MODEL_NAME", MODEL_NAME)
+    model_name = model or default_model
 
     # Đảm bảo tiền tố phù hợp nếu dùng OpenRouter
     if "openrouter.ai" in base_url and "/" not in model_name:

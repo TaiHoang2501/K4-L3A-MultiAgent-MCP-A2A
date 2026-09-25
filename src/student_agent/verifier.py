@@ -73,7 +73,7 @@ FALLBACK_RULES: dict[str, dict[str, Any]] = {
     }
 }
 
-STRONG, MEDIUM, WEAK = 0.95, 0.8, 0.7
+STRONG, MEDIUM = 0.95, 0.8
 CENT = Decimal("0.01")
 
 
@@ -173,6 +173,174 @@ def _unique(values: list[Any]) -> list[Any]:
     return list(dict.fromkeys(v for v in values if v not in (None, "")))
 
 
+def scope_facts(case: dict[str, Any], data_by_tool: dict[str, Any]) -> CaseFacts:
+    """Drop rows that fall outside this order's lifecycle (injected distractors).
+
+    ``data_by_tool`` maps MCP tool names to their ``data`` payloads. Shared by the
+    verifier and the specialists so every agent reasons over the same rows.
+    """
+
+    def data(tool: str) -> Any:
+        return data_by_tool.get(tool)
+
+    order = data(ORDER) if isinstance(data(ORDER), dict) else None
+    opened = _ts(case.get("opened_at"))
+    purchase = _ts(order.get("order_purchase_timestamp")) if order else None
+    approved = (_ts(order.get("order_approved_at")) if order else None) or purchase
+    estimated = _ts(order.get("order_estimated_delivery_date")) if order else None
+    delivered = _ts(order.get("order_delivered_customer_date")) if order else None
+    capture_end = approved + timedelta(days=1) if approved else opened
+    tail_end = max((d for d in (opened, delivered) if d), default=None)
+    if tail_end is not None:
+        tail_end += timedelta(days=1)
+    excluded = 0
+
+    def scoped(rows: list[Any], key: str, low: Any, high: Any) -> list[dict[str, Any]]:
+        nonlocal excluded
+        rows = _dedupe(rows)
+        if low is None and high is None:
+            return rows
+        kept = [r for r in rows if _within(r.get(key), low, high)]
+        excluded += len(rows) - len(kept)
+        return kept
+
+    raw_items = data(ITEMS) if isinstance(data(ITEMS), list) else []
+    items = scoped(raw_items, "shipping_limit_date", purchase, estimated or opened)
+    if not items:
+        items = _dedupe(raw_items)
+
+    timeline = data(PAYMENT_TIMELINE) if isinstance(data(PAYMENT_TIMELINE), dict) else {}
+    events = timeline.get("events") or []
+    captures = scoped(
+        [e for e in events if e.get("event_type") == "captured"], "event_at", purchase,
+        capture_end,
+    )
+    payment_events = scoped(
+        [e for e in events if e.get("event_type") != "captured"], "event_at", purchase,
+        opened,
+    )
+    if not timeline and isinstance(data(PAYMENTS), list):
+        captures = [
+            {"amount_brl": p.get("payment_value"), "event_type": "captured"}
+            for p in _dedupe(data(PAYMENTS))
+        ]
+
+    refund_data = data(REFUNDS) if isinstance(data(REFUNDS), dict) else {}
+    refunds = scoped(refund_data.get("events") or [], "event_at", purchase, opened)
+
+    shipment = data(SHIPMENT) if isinstance(data(SHIPMENT), dict) else None
+    shipment_events = scoped(
+        (shipment or {}).get("events") or [], "event_at", purchase, tail_end
+    )
+
+    seller_ids = _unique([i.get("seller_id") for i in items])
+    if not seller_ids and isinstance(data(SELLERS), list):
+        seller_ids = _unique([s.get("seller_id") for s in data(SELLERS)])
+
+    policy = data(POLICY) if isinstance(data(POLICY), dict) else {}
+    return CaseFacts(
+        order=order,
+        items=items,
+        captures=captures,
+        payment_events=payment_events,
+        refunds=refunds,
+        shipment=shipment,
+        shipment_events=shipment_events,
+        seller_ids=seller_ids,
+        policy_rules=policy.get("rules") or {},
+        opened_at=opened,
+        excluded_records=excluded,
+    )
+
+
+def detect_payment_issue(facts: CaseFacts) -> Decision | None:
+    """Money-side issues: refund lifecycle, paid-but-not-fulfilled, mismatch, duplicate, split."""
+    order = facts.order or {}
+    failed = [r for r in facts.refunds if r.get("status") == "failed"]
+    if failed:
+        amount = sum((_money(r.get("amount_brl")) for r in failed), Decimal("0"))
+        return Decision("refund_failed", STRONG, "REFUND_FAILED", amount)
+    if any(r.get("status") == "pending" for r in facts.refunds):
+        # The refund is already in flight: monitor it, do not pay it twice.
+        return Decision("refund_pending", STRONG, "REFUND_PENDING", Decimal("0"))
+
+    status = order.get("order_status")
+    if status in ("canceled", "unavailable") and facts.captures:
+        return Decision(
+            f"{status}_order_paid", STRONG, f"ORDER_{status.upper()}_WITH_CAPTURE",
+            facts.captured_total,
+        )
+
+    mismatches = [
+        e for e in facts.payment_events
+        if e.get("event_type") == "reconciliation_mismatch" and e.get("status") != "resolved"
+    ]
+    if mismatches:
+        amount = sum((_money(e.get("amount_brl")) for e in mismatches), Decimal("0"))
+        return Decision("payment_mismatch", STRONG, "RECONCILIATION_MISMATCH_OPEN", amount)
+
+    total = facts.order_total
+    if len(facts.captures) >= 2:
+        amounts = [_money(c.get("amount_brl")) for c in facts.captures]
+        repeated = [a for a in set(amounts) if amounts.count(a) > 1]
+        overpaid = total > 0 and facts.captured_total > total
+        if repeated and overpaid:
+            extra = sum((a * (amounts.count(a) - 1) for a in repeated), Decimal("0"))
+            return Decision("duplicate_charge", STRONG, "REPEATED_CAPTURE_OVER_TOTAL", extra)
+        if total > 0 and facts.captured_total == total:
+            return Decision("valid_split_payment", STRONG, "SPLIT_CAPTURES_MATCH_TOTAL",
+                            Decimal("0"))
+
+    return None
+
+
+def detect_late_delivery(facts: CaseFacts) -> Decision | None:
+    """Lateness comes from the authoritative order timestamps, never from events alone."""
+    order = facts.order or {}
+    delivered = _ts(order.get("order_delivered_customer_date"))
+    estimated = _ts(order.get("order_estimated_delivery_date"))
+    if delivered is not None:
+        is_late = estimated is not None and delivered > estimated
+    else:
+        # Not delivered yet: late only if the promise already expired when the case opened.
+        opened = facts.opened_at
+        is_late = (
+            order.get("order_status") in ("shipped", "processing", "invoiced")
+            and estimated is not None and opened is not None and opened > estimated
+        )
+    if not is_late:
+        return None
+
+    # A delivered_late event only attributes blame when it describes this delivery.
+    late_events = [
+        e for e in facts.shipment_events
+        if e.get("event_type") == "delivered_late"
+        and (delivered is None or _same_day(e.get("event_at"), delivered))
+    ]
+    carrier = _ts(order.get("order_delivered_carrier_date"))
+    limits = [_ts(i.get("shipping_limit_date")) for i in facts.items]
+    limits = [limit for limit in limits if limit]
+    handoff_late = bool(carrier and limits and carrier > max(limits))
+    actors = {e.get("actor") for e in late_events}
+
+    if handoff_late or actors == {"seller"}:
+        issue = "late_delivery_seller"
+    else:
+        issue = "late_delivery_logistics"
+    corroborated = delivered is not None and bool(late_events) and (
+        (issue == "late_delivery_seller") == ("seller" in actors)
+    )
+    freight = sum((_money(i.get("freight_value")) for i in facts.items), Decimal("0"))
+    if facts.captured_total > 0:
+        freight = min(freight, facts.captured_total)
+    return Decision(
+        issue,
+        STRONG if corroborated else MEDIUM,
+        "SELLER_HANDOFF_LATE" if issue == "late_delivery_seller" else "CARRIER_TRANSIT_LATE",
+        freight,
+    )
+
+
 class VerifierAgent:
     actor = "verifier"
 
@@ -221,195 +389,39 @@ class VerifierAgent:
         return accepted, rejected
 
     def _scope_facts(self, case: dict[str, Any], evidence: dict[str, Evidence]) -> CaseFacts:
-        """Drop rows that fall outside this order's lifecycle (injected distractors)."""
-
-        def data(tool: str) -> Any:
-            return evidence[tool].data if tool in evidence else None
-
-        order = data(ORDER) if isinstance(data(ORDER), dict) else None
-        opened = _ts(case.get("opened_at"))
-        purchase = _ts(order.get("order_purchase_timestamp")) if order else None
-        approved = (_ts(order.get("order_approved_at")) if order else None) or purchase
-        estimated = _ts(order.get("order_estimated_delivery_date")) if order else None
-        delivered = _ts(order.get("order_delivered_customer_date")) if order else None
-        capture_end = approved + timedelta(days=1) if approved else opened
-        tail_end = max((d for d in (opened, delivered) if d), default=None)
-        if tail_end is not None:
-            tail_end += timedelta(days=1)
-        excluded = 0
-
-        def scoped(rows: list[Any], key: str, low: Any, high: Any) -> list[dict[str, Any]]:
-            nonlocal excluded
-            rows = _dedupe(rows)
-            if low is None and high is None:
-                return rows
-            kept = [r for r in rows if _within(r.get(key), low, high)]
-            excluded += len(rows) - len(kept)
-            return kept
-
-        raw_items = data(ITEMS) if isinstance(data(ITEMS), list) else []
-        items = scoped(raw_items, "shipping_limit_date", purchase, estimated or opened)
-        if not items:
-            items = _dedupe(raw_items)
-
-        timeline = data(PAYMENT_TIMELINE) if isinstance(data(PAYMENT_TIMELINE), dict) else {}
-        events = timeline.get("events") or []
-        captures = scoped(
-            [e for e in events if e.get("event_type") == "captured"], "event_at", purchase,
-            capture_end,
-        )
-        payment_events = scoped(
-            [e for e in events if e.get("event_type") != "captured"], "event_at", purchase,
-            opened,
-        )
-        if not timeline and isinstance(data(PAYMENTS), list):
-            captures = [
-                {"amount_brl": p.get("payment_value"), "event_type": "captured"}
-                for p in _dedupe(data(PAYMENTS))
-            ]
-
-        refund_data = data(REFUNDS) if isinstance(data(REFUNDS), dict) else {}
-        refunds = scoped(refund_data.get("events") or [], "event_at", purchase, opened)
-
-        shipment = data(SHIPMENT) if isinstance(data(SHIPMENT), dict) else None
-        shipment_events = scoped(
-            (shipment or {}).get("events") or [], "event_at", purchase, tail_end
-        )
-
-        seller_ids = _unique([i.get("seller_id") for i in items])
-        if not seller_ids and isinstance(data(SELLERS), list):
-            seller_ids = _unique([s.get("seller_id") for s in data(SELLERS)])
-
-        policy = data(POLICY) if isinstance(data(POLICY), dict) else {}
-        return CaseFacts(
-            order=order,
-            items=items,
-            captures=captures,
-            payment_events=payment_events,
-            refunds=refunds,
-            shipment=shipment,
-            shipment_events=shipment_events,
-            seller_ids=seller_ids,
-            policy_rules=policy.get("rules") or {},
-            opened_at=opened,
-            excluded_records=excluded,
-        )
+        return scope_facts(case, {tool: item.data for tool, item in evidence.items()})
 
     # ---------------------------------------------------------------- the decision
     def _decide(self, facts: CaseFacts) -> Decision:
         order = facts.order
         if order is None:
             return Decision(INSUFFICIENT, 0.3, "ORDER_EVIDENCE_MISSING")
-
-        failed = [r for r in facts.refunds if r.get("status") == "failed"]
-        if failed:
-            amount = sum((_money(r.get("amount_brl")) for r in failed), Decimal("0"))
-            return Decision("refund_failed", STRONG, "REFUND_FAILED", amount)
-        if any(r.get("status") == "pending" for r in facts.refunds):
-            # The refund is already in flight: monitor it, do not pay it twice.
-            return Decision("refund_pending", STRONG, "REFUND_PENDING", Decimal("0"))
-
+        decision = detect_payment_issue(facts) or detect_late_delivery(facts)
+        if decision is not None:
+            return decision
         status = order.get("order_status")
-        if status in ("canceled", "unavailable") and facts.captures:
-            return Decision(
-                f"{status}_order_paid", STRONG, f"ORDER_{status.upper()}_WITH_CAPTURE",
-                facts.captured_total,
-            )
-
-        mismatches = [
-            e for e in facts.payment_events
-            if e.get("event_type") == "reconciliation_mismatch" and e.get("status") != "resolved"
-        ]
-        if mismatches:
-            amount = sum((_money(e.get("amount_brl")) for e in mismatches), Decimal("0"))
-            return Decision("payment_mismatch", STRONG, "RECONCILIATION_MISMATCH_OPEN", amount)
-
-        total = facts.order_total
-        if len(facts.captures) >= 2:
-            amounts = [_money(c.get("amount_brl")) for c in facts.captures]
-            repeated = [a for a in set(amounts) if amounts.count(a) > 1]
-            overpaid = total > 0 and facts.captured_total > total
-            if repeated and overpaid:
-                extra = sum((a * (amounts.count(a) - 1) for a in repeated), Decimal("0"))
-                return Decision("duplicate_charge", STRONG, "REPEATED_CAPTURE_OVER_TOTAL", extra)
-            if total > 0 and facts.captured_total == total:
-                return Decision("valid_split_payment", STRONG, "SPLIT_CAPTURES_MATCH_TOTAL",
-                                Decimal("0"))
-
-        late = self._late_delivery(facts)
-        if late is not None:
-            return late
-
         if status in ("canceled", "unavailable"):
             # Canceled/unavailable without an in-scope capture: nothing was paid.
             return Decision(UNSUPPORTED, MEDIUM, f"ORDER_{status.upper()}_NOT_CHARGED",
                             Decimal("0"))
         return Decision(UNSUPPORTED, 0.9, "NO_DEVIATION_FOUND", Decimal("0"))
 
-    def _late_delivery(self, facts: CaseFacts) -> Decision | None:
-        """Lateness comes from the authoritative order timestamps, never from events alone."""
-        order = facts.order or {}
-        delivered = _ts(order.get("order_delivered_customer_date"))
-        estimated = _ts(order.get("order_estimated_delivery_date"))
-        if delivered is not None:
-            is_late = estimated is not None and delivered > estimated
-        else:
-            # Not delivered yet: late only if the promise already expired when the case opened.
-            opened = facts.opened_at
-            is_late = (
-                order.get("order_status") in ("shipped", "processing", "invoiced")
-                and estimated is not None and opened is not None and opened > estimated
-            )
-        if not is_late:
-            return None
-
-        # A delivered_late event only attributes blame when it describes this delivery.
-        late_events = [
-            e for e in facts.shipment_events
-            if e.get("event_type") == "delivered_late"
-            and (delivered is None or _same_day(e.get("event_at"), delivered))
-        ]
-        carrier = _ts(order.get("order_delivered_carrier_date"))
-        limits = [_ts(i.get("shipping_limit_date")) for i in facts.items]
-        limits = [limit for limit in limits if limit]
-        handoff_late = bool(carrier and limits and carrier > max(limits))
-        actors = {e.get("actor") for e in late_events}
-
-        if handoff_late or actors == {"seller"}:
-            issue = "late_delivery_seller"
-        else:
-            issue = "late_delivery_logistics"
-        corroborated = delivered is not None and bool(late_events) and (
-            (issue == "late_delivery_seller") == ("seller" in actors)
-        )
-        freight = sum((_money(i.get("freight_value")) for i in facts.items), Decimal("0"))
-        if facts.captured_total > 0:
-            freight = min(freight, facts.captured_total)
-        return Decision(
-            issue,
-            STRONG if corroborated else MEDIUM,
-            "SELLER_HANDOFF_LATE" if issue == "late_delivery_seller" else "CARRIER_TRANSIT_LATE",
-            freight,
-        )
-
     def _reconcile(
         self, decision: Decision, facts: CaseFacts, reports: list[SpecialistReport]
     ) -> tuple[Decision, int]:
-        """Compare with specialist proposals; adopt one only when our own signal is weak."""
+        """Compare with specialist proposals; the evidence-backed decision always wins.
+
+        Specialists see only their own domain and can be fooled by distractor rows
+        (for example a stale delivered_late event), so a disagreement only lowers
+        confidence. Without the order row there is nothing to adjudicate with.
+        """
         proposals = [
             r for r in reports
             if r.proposed_issue in PRIMARY_ISSUES and r.proposed_issue != INSUFFICIENT
         ]
         disagreeing = [r for r in proposals if r.proposed_issue != decision.issue]
-        if not disagreeing:
-            return decision, 0
-        weak_verdict = decision.issue in (UNSUPPORTED, INSUFFICIENT) and facts.order is not None
-        candidates = {r.proposed_issue for r in disagreeing}
-        if weak_verdict and len(candidates) == 1:
-            adopted = candidates.pop()
-            return Decision(adopted, WEAK, "ADOPTED_SPECIALIST_PROPOSAL"), len(disagreeing)
-        penalty = 0.1 if decision.confidence >= STRONG else 0.15
-        decision.confidence = max(0.3, decision.confidence - penalty)
+        if disagreeing and facts.order is not None:
+            decision.confidence = max(0.5, decision.confidence - 0.05 * len(disagreeing))
         return decision, len(disagreeing)
 
     # ---------------------------------------------------------------- policy/refund

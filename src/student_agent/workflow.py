@@ -1,12 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, List
+import weakref
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 from pydantic import BaseModel, Field
 
+from .agents.shipment_policy import ShipmentPolicyAgent
+from .evidence import EvidenceLedger
 from .mcp_gateway import EvidenceGateway
 from .order_agent import OrderItemAgent
 from .payment import run_payment_agent
 from .trace import TraceWriter
+from .verifier import PRIMARY_ISSUES, SpecialistReport, VerifierAgent
+
+COORDINATOR = "coordinator"
+ORDER_AGENT = "order-agent"
+PAYMENT_AGENT = "payment_agent"
+SHIPMENT_POLICY_AGENT = "shipment_policy_agent"
+VERIFIER = "verifier"
+MAX_TURNS = 3  # one turn per specialist; the verifier is always the final step
 
 
 class MessageEnvelope(BaseModel):
@@ -14,159 +27,187 @@ class MessageEnvelope(BaseModel):
     sender: str
     receiver: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    evidence_refs_collected: List[str] = Field(default_factory=list)
-    data_conflicts: List[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs_collected: list[str] = Field(default_factory=list)
+    data_conflicts: list[dict[str, Any]] = Field(default_factory=list)
     turn_count: int = 0
 
 
+class RecordingGateway:
+    """Gateway proxy used by specialists: every MCP response lands in the run ledger.
 
-async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
-    """Agent của Dũng"""
-   
-async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
-    """Agent của Dũng"""
-    case = envelope.payload
-    case_id = envelope.case_id
-    claimed_order_id = case.get("customer_request", {}).get("claimed_order_id")
+    The ledger is what the verifier trusts, so specialists cannot hand over an
+    evidence ref that the MCP gateway did not return for this exact case.
+    """
 
-    order_agent = OrderItemAgent(gateway, trace)
-    order_result = await order_agent.run(case_id, claimed_order_id)
+    def __init__(self, gateway: EvidenceGateway, ledger: EvidenceLedger) -> None:
+        self._gateway = gateway
+        self._ledger = ledger
+        self.actor = COORDINATOR
 
-    for ref in order_result.get("evidence_refs", []):
+    async def list_tools(self) -> list[str]:
+        return await self._gateway.list_tools()
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        response = await self._gateway.call(tool_name, case_id=case_id, **arguments)
+        self._ledger.record(
+            case_id=case_id, tool_name=tool_name, actor=self.actor, response=response
+        )
+        return response
+
+
+# One ledger per run (per TraceWriter) so evidence reuse across cases is detected.
+_LEDGERS: weakref.WeakKeyDictionary[TraceWriter, EvidenceLedger] = weakref.WeakKeyDictionary()
+
+
+def _ledger_for(trace: TraceWriter) -> EvidenceLedger:
+    ledger = _LEDGERS.get(trace)
+    if ledger is None:
+        ledger = _LEDGERS[trace] = EvidenceLedger()
+    return ledger
+
+
+def _collect(envelope: MessageEnvelope, refs: list[str]) -> None:
+    for ref in refs:
         if ref not in envelope.evidence_refs_collected:
             envelope.evidence_refs_collected.append(ref)
 
+
+async def call_order_agent(
+    envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter
+) -> MessageEnvelope:
+    """Agent của Dũng"""
+    claimed_order_id = envelope.payload.get("customer_request", {}).get("claimed_order_id")
+    order_result = await OrderItemAgent(gateway, trace).run(envelope.case_id, claimed_order_id)
+    _collect(envelope, order_result.get("evidence_refs", []))
     envelope.payload["order_agent_result"] = order_result
-    envelope.sender = "order_agent"
+    envelope.sender = ORDER_AGENT
     return envelope
 
-async def call_payment_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
-    """Agent của Long"""
-  
-    envelope.sender = "payment_agent"
+
+async def call_payment_agent(
+    envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter
+) -> MessageEnvelope:
+    """Agent của Long: Chuyên gia điều tra Thanh toán & Dòng tiền"""
+    envelope = await run_payment_agent(envelope, gateway, trace)
+    envelope.sender = PAYMENT_AGENT
     return envelope
 
-async def call_shipment_policy_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
+
+async def call_shipment_policy_agent(
+    envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter
+) -> MessageEnvelope:
     """Agent của Quân"""
-    from .agents.shipment_policy import ShipmentPolicyAgent
-
     payload = envelope.payload
     customer_request = payload.get("customer_request", {})
-
-    order_id = (
-        payload.get("order_id")
-        or customer_request.get("claimed_order_id")
-        or payload.get("claimed_order_id")
-        or ""
-    )
-    claims = (
-        payload.get("claims")
-        or customer_request.get("claims")
-        or []
-    )
-    policy_version = payload.get("policy_version") or "EC_POLICY_V1"
-
-    agent = ShipmentPolicyAgent(gateway, trace)
-    report = await agent.investigate(
+    report = await ShipmentPolicyAgent(gateway, trace).investigate(
         case_id=envelope.case_id,
-        order_id=order_id,
-        claims=claims,
-        policy_version=policy_version,
+        order_id=customer_request.get("claimed_order_id") or payload.get("order_id") or "",
+        claims=customer_request.get("claims") or [],
+        policy_version=payload.get("policy_version") or "EC_POLICY_V1",
+        order=(payload.get("order_agent_result") or {}).get("order_data"),
+        opened_at=payload.get("opened_at"),
     )
-
-    envelope.sender = "shipment_policy_agent"
-    envelope.receiver = "verifier_agent"
-    envelope.turn_count += 1
+    _collect(envelope, report.get("evidence_refs", []))
+    envelope.data_conflicts.extend(report.get("data_conflicts") or [])
     envelope.payload["shipment_policy_report"] = report
-
-    # Thu thập evidence references
-    for ref in report.get("evidence_refs", []):
-        if ref not in envelope.evidence_refs_collected:
-            envelope.evidence_refs_collected.append(ref)
-
-    # Thu thập data conflicts nếu có
-    if report.get("data_conflicts"):
-        envelope.data_conflicts.extend(report.get("data_conflicts", []))
-
-    """Agent của Long: Chuyên gia điều tra Thanh toán & Dòng tiền"""
-    return await run_payment_agent(envelope, gateway, trace)
-
-
-async def call_shipment_policy_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
-    """Agent của Quân"""
-
-    envelope.sender = "shipment_policy_agent"
+    envelope.sender = SHIPMENT_POLICY_AGENT
     return envelope
 
-async def call_verifier_agent(envelope: MessageEnvelope, trace: TraceWriter) -> dict[str, Any]:
+
+def _proposals(envelope: MessageEnvelope) -> dict[str, str | None]:
+    """Issue each specialist claims to have found, when it is inside its own domain."""
+    payment = envelope.payload.get("payment_analysis") or {}
+    shipment = (envelope.payload.get("shipment_policy_report") or {}).get(
+        "policy_recommendation"
+    ) or {}
+    shipment_issue = shipment.get("primary_issue")
     return {
-        "primary_issue": "needs_investigation",
-        "case_status": "needs_investigation",
-        "confidence": 0.0,
-        "affected_entities": {"buyer_id": None, "seller_id": None, "order_id": None, "shipment_tracking_id": None},
-        "evidence_refs": envelope.evidence_refs_collected,
-        "data_conflicts": envelope.data_conflicts,
+        ORDER_AGENT: None,
+        PAYMENT_AGENT: payment.get("detected_issue"),
+        # Its default "unsupported_claim" only means "no shipment problem".
+        SHIPMENT_POLICY_AGENT: shipment_issue
+        if shipment_issue in ("late_delivery_seller", "late_delivery_logistics")
+        else None,
     }
+
+
+def call_verifier_agent(
+    case: dict[str, Any], envelope: MessageEnvelope, ledger: EvidenceLedger, trace: TraceWriter
+) -> dict[str, Any]:
+    """Thành viên 5: build A2A reports from the ledger and let the verifier decide."""
+    by_actor: dict[str, SpecialistReport] = {}
+    proposals = _proposals(envelope)
+    for evidence in ledger.for_case(envelope.case_id):
+        report = by_actor.get(evidence.actor)
+        if report is None:
+            proposed = proposals.get(evidence.actor)
+            report = by_actor[evidence.actor] = SpecialistReport(
+                agent=evidence.actor,
+                case_id=envelope.case_id,
+                proposed_issue=proposed if proposed in PRIMARY_ISSUES else None,
+            )
+        report.evidence.append(evidence)
+    verifier = VerifierAgent(trace.contracts, ledger, trace)
+    return verifier.verify(case, list(by_actor.values()))
+
 
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    """
-    Luồng điều phối trung tâm của toàn hệ thống (Coordinator).
-    """
-    case_id = case.get("case_id", "UNKNOWN")
-    
+    """Coordinator: route the case through the specialists, then to the verifier.
 
-    trace.info("agent_started", {"case_id": case_id, "role": "coordinator"})
-    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-    
+    `case_received` and `case_finalized` are emitted by the CLI around this call.
+    """
+    case_id = case["case_id"]
+    ledger = _ledger_for(trace)
+    recorder = RecordingGateway(gateway, ledger)
     envelope = MessageEnvelope(
-        case_id=case_id,
-        sender="coordinator",
-        receiver="order_agent",
-        payload=case, 
+        case_id=case_id, sender=COORDINATOR, receiver=ORDER_AGENT, payload=dict(case)
     )
-    
-    try:
-        trace.info("handoff", {"from": "coordinator", "to": "order_agent"})
-        envelope = await call_order_agent(envelope, gateway, trace)
-        
-        trace.info("handoff", {"from": "order_agent", "to": "payment_agent"})
-        envelope = await call_payment_agent(envelope, gateway, trace)
-        
-        trace.info("handoff", {"from": "payment_agent", "to": "shipment_policy_agent"})
-        envelope = await call_shipment_policy_agent(envelope, gateway, trace)
-        
-        trace.info("handoff", {"from": "shipment_policy_agent", "to": "verifier_agent"})
-        final_output = await call_verifier_agent(envelope, trace)
-        
-        trace.info("handoff_completed", {"case_id": case_id})
-        return final_output
-        
-    except Exception as e:
-        trace.error("workflow_error", {"case_id": case_id, "error": str(e)})
-        trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="order_agent")
-        envelope = await call_order_agent(envelope, gateway, trace)
-        
-        trace.emit(case_id=case_id, event_type="handoff", actor="order_agent", target="payment_agent")
-        envelope = await call_payment_agent(envelope, gateway, trace)
-        
-        trace.emit(case_id=case_id, event_type="handoff", actor="payment_agent", target="shipment_policy_agent")
-        envelope = await call_shipment_policy_agent(envelope, gateway, trace)
-        
-        trace.emit(case_id=case_id, event_type="handoff", actor="shipment_policy_agent", target="verifier_agent")
-        final_output = await call_verifier_agent(envelope, trace)
-        
-        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
-        return final_output
-        
-    except Exception as e:
-        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator", attributes={"error": str(e)})
-        
-        return {
-            "primary_issue": "needs_investigation",
-            "case_status": "action_required",
-            "confidence": 0.0,
-            "evidence_refs": [],
-            "affected_entities": {"buyer_id": None, "seller_id": None, "order_id": None, "shipment_tracking_id": None},
-        }
+    plan: list[
+        tuple[str, Callable[..., Awaitable[MessageEnvelope]]]
+    ] = [
+        (ORDER_AGENT, call_order_agent),
+        (PAYMENT_AGENT, call_payment_agent),
+        (SHIPMENT_POLICY_AGENT, call_shipment_policy_agent),
+    ][:MAX_TURNS]
+
+    for actor, _ in plan:
+        trace.emit(case_id=case_id, event_type="task_assigned", actor=COORDINATOR, target=actor)
+
+    for actor, run_agent in plan:
+        trace.emit(case_id=case_id, event_type="handoff", actor=COORDINATOR, target=actor)
+        envelope.receiver = actor
+        envelope.turn_count += 1
+        recorder.actor = actor
+        before = len(ledger.for_case(case_id))
+        try:
+            envelope = await run_agent(envelope, recorder, trace)
+            outcome = "SPECIALIST_DONE"
+        except Exception as exc:  # a failing specialist must not sink the whole case
+            outcome = "SPECIALIST_FAILED"
+            error = f"{type(exc).__name__}: {exc}"[:200]
+        else:
+            error = None
+        refs = [e.evidence_ref for e in ledger.for_case(case_id)[before:]]
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=actor,
+            target=COORDINATOR,
+            decision_code=outcome,
+            evidence_refs=refs[:20] or None,
+            attributes={"error": error} if error else None,
+        )
+    recorder.actor = COORDINATOR
+
+    trace.emit(case_id=case_id, event_type="task_assigned", actor=COORDINATOR, target=VERIFIER)
+    trace.emit(
+        case_id=case_id,
+        event_type="handoff",
+        actor=COORDINATOR,
+        target=VERIFIER,
+        attributes={"evidence_count": len(ledger.for_case(case_id))},
+    )
+    envelope.receiver = VERIFIER
+    return call_verifier_agent(case, envelope, ledger, trace)

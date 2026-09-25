@@ -7,7 +7,10 @@ from .trace import TraceWriter
 
 
 class OrderItemAgent:
-    """Agent chuyên trách xác minh thông tin đơn hàng, sản phẩm và người bán (Order, Items, Products, Sellers)."""
+    """Agent xác minh thông tin đơn hàng, sản phẩm và người bán.
+
+    Phạm vi: Order, Items, Products, Sellers.
+    """
 
     def __init__(self, gateway: EvidenceGateway, trace: TraceWriter) -> None:
         self.gateway = gateway
@@ -105,10 +108,9 @@ class OrderItemAgent:
             except Exception:
                 items_data = []
 
-        # 3. Trích xuất item_id, product_id, seller_id và truy vấn product context
+        # 3. Trích xuất item_id, seller_id
         for item in items_data:
             item_id = str(item.get("order_item_id") or item.get("item_id") or "")
-            product_id = str(item.get("product_id") or "")
             seller_id = str(item.get("seller_id") or "")
 
             if item_id and item_id not in item_ids:
@@ -116,29 +118,29 @@ class OrderItemAgent:
             if seller_id and seller_id not in seller_ids:
                 seller_ids.append(seller_id)
 
-            # 4. Gọi MCP tool: get_product_context cho từng sản phẩm
-            if product_id:
-                try:
-                    prod_resp = await self.gateway.call(
-                        "get_product_context",
-                        case_id=case_id,
-                        product_id=product_id,
-                    )
-                    ev_ref = prod_resp["evidence_ref"]
-                    evidence_refs.append(ev_ref)
-                    if prod_resp.get("data"):
-                        products_data.append(prod_resp["data"])
+        # 4. Gọi MCP tool: get_product_context (tool chỉ nhận order_id, trả về mọi sản phẩm)
+        if items_data:
+            try:
+                prod_resp = await self.gateway.call(
+                    "get_product_context",
+                    case_id=case_id,
+                    order_id=claimed_order_id,
+                )
+                ev_ref = prod_resp["evidence_ref"]
+                evidence_refs.append(ev_ref)
+                raw_products = prod_resp.get("data") or []
+                products_data = raw_products if isinstance(raw_products, list) else [raw_products]
 
-                    self.trace.emit(
-                        case_id=case_id,
-                        event_type="tool_result_consumed",
-                        actor="order-agent",
-                        tool_name="get_product_context",
-                        evidence_refs=[ev_ref],
-                        attributes={"product_id": product_id},
-                    )
-                except Exception:
-                    pass
+                self.trace.emit(
+                    case_id=case_id,
+                    event_type="tool_result_consumed",
+                    actor="order-agent",
+                    tool_name="get_product_context",
+                    evidence_refs=[ev_ref],
+                    attributes={"products_count": len(products_data)},
+                )
+            except Exception:
+                products_data = []
 
         # 5. Tính toán tổng tiền hàng và cước vận chuyển
         total_items_price = sum(float(item.get("price", 0.0)) for item in items_data)
