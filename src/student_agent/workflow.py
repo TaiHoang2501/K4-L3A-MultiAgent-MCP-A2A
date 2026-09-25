@@ -4,6 +4,7 @@ from typing import Any, List
 from pydantic import BaseModel, Field
 
 from .mcp_gateway import EvidenceGateway
+from .order_agent import OrderItemAgent
 from .trace import TraceWriter
 
 
@@ -17,10 +18,20 @@ class MessageEnvelope(BaseModel):
     turn_count: int = 0
 
 
-
 async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
     """Agent của Dũng"""
-   
+    case = envelope.payload
+    case_id = envelope.case_id
+    claimed_order_id = case.get("customer_request", {}).get("claimed_order_id")
+
+    order_agent = OrderItemAgent(gateway, trace)
+    order_result = await order_agent.run(case_id, claimed_order_id)
+
+    for ref in order_result.get("evidence_refs", []):
+        if ref not in envelope.evidence_refs_collected:
+            envelope.evidence_refs_collected.append(ref)
+
+    envelope.payload["order_agent_result"] = order_result
     envelope.sender = "order_agent"
     return envelope
 
