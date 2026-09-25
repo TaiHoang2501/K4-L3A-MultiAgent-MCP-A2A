@@ -55,7 +55,7 @@ async def solve_case(
     case_id = case.get("case_id", "UNKNOWN")
     
 
-    trace.info("agent_started", {"case_id": case_id, "role": "coordinator"})
+    trace.emit(case_id=case_id, event_type="agent_started", actor="coordinator")
     
     envelope = MessageEnvelope(
         case_id=case_id,
@@ -65,23 +65,23 @@ async def solve_case(
     )
     
     try:
-        trace.info("handoff", {"from": "coordinator", "to": "order_agent"})
+        trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="order_agent")
         envelope = await call_order_agent(envelope, gateway, trace)
         
-        trace.info("handoff", {"from": "order_agent", "to": "payment_agent"})
+        trace.emit(case_id=case_id, event_type="handoff", actor="order_agent", target="payment_agent")
         envelope = await call_payment_agent(envelope, gateway, trace)
         
-        trace.info("handoff", {"from": "payment_agent", "to": "shipment_policy_agent"})
+        trace.emit(case_id=case_id, event_type="handoff", actor="payment_agent", target="shipment_policy_agent")
         envelope = await call_shipment_policy_agent(envelope, gateway, trace)
         
-        trace.info("handoff", {"from": "shipment_policy_agent", "to": "verifier_agent"})
+        trace.emit(case_id=case_id, event_type="handoff", actor="shipment_policy_agent", target="verifier_agent")
         final_output = await call_verifier_agent(envelope, trace)
         
-        trace.info("handoff_completed", {"case_id": case_id})
+        trace.emit(case_id=case_id, event_type="handoff_completed", actor="coordinator")
         return final_output
         
     except Exception as e:
-        trace.error("workflow_error", {"case_id": case_id, "error": str(e)})
+        trace.emit(case_id=case_id, event_type="workflow_error", actor="coordinator", attributes={"error": str(e)})
         
         return {
             "primary_issue": "needs_investigation",
