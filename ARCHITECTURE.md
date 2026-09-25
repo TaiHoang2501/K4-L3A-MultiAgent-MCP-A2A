@@ -68,7 +68,7 @@ Trước khi Verifier xuất JSON cuối cùng, các biến bất biến (invari
 
 ## 7. Reproducibility
 
-*   **Model**: Sử dụng cố định OpenAI `gpt-4o-mini`.
+*   **Model**: Sử dụng cố định **`Gemini 3.1 Flash Light`**.
 *   **Config**: `temperature = 0.0` cho toàn bộ Agents để đảm bảo tính tất định (deterministic).
 *   **Concurrency**: Chạy lệnh giới hạn song song 10 cases (`max_workers=10`).
 *   **Dependencies**: Pin cứng phiên bản trong `pyproject.toml` và `uv.lock`.
