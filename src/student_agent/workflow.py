@@ -4,6 +4,7 @@ from typing import Any, List
 from pydantic import BaseModel, Field
 
 from .mcp_gateway import EvidenceGateway
+from .payment import run_payment_agent
 from .trace import TraceWriter
 
 
@@ -25,10 +26,9 @@ async def call_order_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, 
     return envelope
 
 async def call_payment_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
-    """Agent của Long"""
-  
-    envelope.sender = "payment_agent"
-    return envelope
+    """Agent của Long: Chuyên gia điều tra Thanh toán & Dòng tiền"""
+    return await run_payment_agent(envelope, gateway, trace)
+
 
 async def call_shipment_policy_agent(envelope: MessageEnvelope, gateway: EvidenceGateway, trace: TraceWriter) -> MessageEnvelope:
     """Agent của Quân"""
