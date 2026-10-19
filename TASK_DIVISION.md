@@ -19,7 +19,7 @@ Dưới đây là cách chia cụ thể:
     *   `get_product_context`
 *   **Đầu ra:** Báo cáo xem đơn hàng có thật không, sản phẩm mua là gì, tình trạng gói hàng cơ bản.
 
-## 3. Long: Payment Agent (Chuyên gia Thanh toán)
+## 3. Nguyễn Hải Long (2A202602471): Payment Agent (Chuyên gia Thanh toán)
 *   **Trách nhiệm chính:** Phụ trách Agent chuyên điều tra về dòng tiền, thanh toán, và tiến trình hoàn tiền (refund).
 *   **MCP Tools được cấp quyền:** 
     *   `get_order_payments`
